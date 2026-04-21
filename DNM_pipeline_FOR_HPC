@@ -1,0 +1,609 @@
+#!/bin/bash
+# DNM PIPELINE
+# To use: bash run_dnm_pipeline_rhea
+
+# Edit this with desired species
+
+BASE="/scratch/jianzhi_root/jianzhi0/yangliy/urop25/Alex/mutation_pipeline"
+
+FATHER_ACC="SRR17072476"
+MOTHER_ACC="SRR17072475"
+CHILD_ACC="SRR17072474"
+SPECIES="Eublepharis_macularius"
+REF_URL="https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/028/583/425/GCF_028583425.1_MPM_Emac_v1.0/GCF_028583425.1_MPM_Emac_v1.0_genomic.fna.gz"
+
+ACCOUNT="jianzhi1"
+PARTITION="standard"
+MAIL="popovici@umich.edu"
+
+# PATHS
+
+
+GATK_JAR="$BASE/github_codes/gatk-4.6.2.0/gatk-package-4.6.2.0-local.jar"
+PICARD="$BASE/github_codes/picard.jar"
+SAMTOOLS="$BASE/github_codes/samtools/samtools"
+BWA="$BASE/github_codes/bwa/bwa"
+SOAP="$BASE/github_codes/SOAPnuke/SOAPnuke"
+SRA_BIN="$BASE/github_codes/sratoolkit.3.4.1-ubuntu64/bin"
+
+RAW="$BASE/data/raw/$SPECIES"
+TRIM="$BASE/data/trimmed/$SPECIES"
+REF_DIR="$BASE/data/reference/$SPECIES"
+BAM_DIR="$BASE/outputs/bam/$SPECIES"
+GVCF_CHUNKS="$BASE/outputs/gvcf_chunks/$SPECIES"
+GVCF_FINAL="$BASE/outputs/gvcf_final/$SPECIES"
+JOINT_DIR="$BASE/outputs/joint/$SPECIES"
+GENO_CHUNKS="$BASE/outputs/geno_chunks/$SPECIES"
+DNM_DIR="$BASE/outputs/dnm/$SPECIES"
+INTERVALS_DIR="$BASE/intervals/$SPECIES"
+LOG_DIR="$BASE/logs/$SPECIES"
+TMP="$BASE/tmp/$SPECIES"
+SCRIPTS_DIR="$BASE/scripts/$SPECIES"
+
+REF="$REF_DIR/genome.fna"
+
+mkdir -p "$RAW" "$TRIM" "$REF_DIR" "$BAM_DIR" \
+         "$GVCF_FINAL" "$JOINT_DIR" "$GENO_CHUNKS" \
+         "$DNM_DIR" "$INTERVALS_DIR" "$LOG_DIR" "$TMP" "$SCRIPTS_DIR"
+
+for ACC in "$FATHER_ACC" "$MOTHER_ACC" "$CHILD_ACC"; do
+    mkdir -p "$GVCF_CHUNKS/$ACC"
+done
+
+SAMPLES=("$FATHER_ACC" "$MOTHER_ACC" "$CHILD_ACC")
+
+# STEP 1: Download reference genome
+
+JOB_REF=$(sbatch --parsable \
+--job-name=${SPECIES}_ref \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=2 --mem=8G --time=02:00:00 \
+--output=$LOG_DIR/ref_%j.out --error=$LOG_DIR/ref_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+if [ -s "${REF}" ]; then
+    exit 0
+fi
+wget -O "${REF}.gz" "${REF_URL}"
+if [ \$? -ne 0 ]; then exit 1; fi
+gunzip -f "${REF}.gz"
+if [ \$? -ne 0 ]; then exit 1; fi
+EOF
+)
+
+# STEP 2: Index reference
+
+JOB_IDX=$(sbatch --parsable \
+--dependency=afterok:$JOB_REF \
+--job-name=${SPECIES}_idx \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=4 --mem=16G --time=04:00:00 \
+--output=$LOG_DIR/idx_%j.out --error=$LOG_DIR/idx_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+module load Bioinformatics
+module load openjdk/17.0.11_9-n4ldn5m
+if [ ! -f "${REF}.bwt" ]; then
+    ${BWA} index ${REF}
+    if [ \$? -ne 0 ]; then exit 1; fi
+fi
+if [ ! -f "${REF}.fai" ]; then
+    ${SAMTOOLS} faidx ${REF}
+    if [ \$? -ne 0 ]; then exit 1; fi
+fi
+if [ ! -f "${REF%.fna}.dict" ]; then
+    java -jar ${GATK_JAR} CreateSequenceDictionary \
+        -R ${REF} -O ${REF%.fna}.dict
+    if [ \$? -ne 0 ]; then exit 1; fi
+fi
+EOF
+)
+
+# STEP 3: SplitIntervals into 50 chunks
+
+JOB_SPLIT=$(sbatch --parsable \
+--dependency=afterok:$JOB_IDX \
+--job-name=${SPECIES}_split \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=2 --mem=8G --time=01:00:00 \
+--output=$LOG_DIR/split_%j.out --error=$LOG_DIR/split_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+module load Bioinformatics
+module load openjdk/17.0.11_9-n4ldn5m
+if ls ${INTERVALS_DIR}/*.interval_list 1>/dev/null 2>&1; then
+    exit 0
+fi
+java -Xmx6g -jar ${GATK_JAR} SplitIntervals \
+    -R ${REF} \
+    --scatter-count 50 \
+    --subdivision-mode BALANCING_WITHOUT_INTERVAL_SUBDIVISION_WITH_OVERFLOW \
+    -O ${INTERVALS_DIR}
+if [ \$? -ne 0 ]; then exit 1; fi
+EOF
+)
+
+# STEP 4: Download SRA + convert to FASTQ
+
+FASTQ_JOBS=()
+for ACC in "${SAMPLES[@]}"; do
+JOB=$(sbatch --parsable \
+--job-name=${SPECIES}_fq_${ACC} \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=8 --mem=32G --time=24:00:00 \
+--output=$LOG_DIR/fq_${ACC}_%j.out --error=$LOG_DIR/fq_${ACC}_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+export PATH=${SRA_BIN}:\$PATH
+mkdir -p ${TMP} ${RAW}
+
+if [ -s "${RAW}/${ACC}_1.fastq.gz" ] && [ -s "${RAW}/${ACC}_2.fastq.gz" ]; then
+    exit 0
+fi
+
+cd ${RAW}
+prefetch ${ACC} --max-size 100g
+if [ \$? -ne 0 ]; then exit 1; fi
+
+fasterq-dump ${RAW}/${ACC} \
+    --split-files \
+    --threads 8 \
+    --temp ${TMP} \
+    --outdir ${RAW}
+if [ \$? -ne 0 ]; then exit 1; fi
+
+gzip ${RAW}/${ACC}_1.fastq
+if [ \$? -ne 0 ]; then exit 1; fi
+gzip ${RAW}/${ACC}_2.fastq
+if [ \$? -ne 0 ]; then exit 1; fi
+EOF
+)
+FASTQ_JOBS+=($JOB)
+done
+
+FASTQ_DEP=$(IFS=:; echo "afterok:${FASTQ_JOBS[*]}")
+
+# STEP 5: SOAPnuke trim 
+
+TRIM_JOBS=()
+for ACC in "${SAMPLES[@]}"; do
+JOB=$(sbatch --parsable \
+--dependency=$FASTQ_DEP \
+--job-name=${SPECIES}_trim_${ACC} \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=8 --mem=32G --time=12:00:00 \
+--output=$LOG_DIR/trim_${ACC}_%j.out --error=$LOG_DIR/trim_${ACC}_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+mkdir -p ${TRIM}
+
+if [ -s "${TRIM}/${ACC}_clean_1.fq.gz" ] && [ -s "${TRIM}/${ACC}_clean_2.fq.gz" ]; then
+    exit 0
+fi
+
+${SOAP} filter \
+    -1 ${RAW}/${ACC}_1.fastq.gz \
+    -2 ${RAW}/${ACC}_2.fastq.gz \
+    -C ${ACC}_clean_1.fq.gz \
+    -D ${ACC}_clean_2.fq.gz \
+    -o ${TRIM} \
+    -T 8
+if [ \$? -ne 0 ]; then exit 1; fi
+EOF
+)
+TRIM_JOBS+=($JOB)
+done
+
+
+# STEP 6: BWA-MEM align + sort
+
+BWA_JOBS=()
+for i in "${!SAMPLES[@]}"; do
+ACC="${SAMPLES[$i]}"
+TRIM_JOB="${TRIM_JOBS[$i]}"
+JOB=$(sbatch --parsable \
+--dependency=afterok:${JOB_IDX}:${TRIM_JOB} \
+--job-name=${SPECIES}_bwa_${ACC} \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=8 --mem=32G --time=24:00:00 \
+--output=$LOG_DIR/bwa_${ACC}_%j.out --error=$LOG_DIR/bwa_${ACC}_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+mkdir -p ${BAM_DIR}
+
+if [ -s "${BAM_DIR}/${ACC}.sorted.bam" ] && [ -f "${BAM_DIR}/${ACC}.sorted.bam.bai" ]; then
+    exit 0
+fi
+
+${BWA} mem -t 8 ${REF} \
+    ${TRIM}/${ACC}_clean_1.fq.gz \
+    ${TRIM}/${ACC}_clean_2.fq.gz | \
+    ${SAMTOOLS} sort -@ 8 -o ${BAM_DIR}/${ACC}.sorted.bam
+if [ \$? -ne 0 ]; then exit 1; fi
+
+${SAMTOOLS} index ${BAM_DIR}/${ACC}.sorted.bam
+if [ \$? -ne 0 ]; then exit 1; fi
+EOF
+)
+BWA_JOBS+=($JOB)
+done
+
+BWA_DEP=$(IFS=:; echo "afterok:${BWA_JOBS[*]}")
+
+# STEP 7: Picard MarkDuplicates + AddOrReplaceReadGroups 
+
+MARKDUP_JOBS=()
+for ACC in "${SAMPLES[@]}"; do
+JOB=$(sbatch --parsable \
+--dependency=$BWA_DEP \
+--job-name=${SPECIES}_md_${ACC} \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=4 --mem=32G --time=12:00:00 \
+--output=$LOG_DIR/md_${ACC}_%j.out --error=$LOG_DIR/md_${ACC}_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+module load Bioinformatics
+module load openjdk/17.0.11_9-n4ldn5m
+
+if [ -s "${BAM_DIR}/${ACC}.RG.bam" ] && [ -f "${BAM_DIR}/${ACC}.RG.bam.bai" ]; then
+    exit 0
+fi
+
+java -Xmx28G -jar ${PICARD} MarkDuplicates \
+    I=${BAM_DIR}/${ACC}.sorted.bam \
+    O=${BAM_DIR}/${ACC}.markdup.bam \
+    M=${BAM_DIR}/${ACC}.metrics.txt
+if [ \$? -ne 0 ]; then exit 1; fi
+
+java -Xmx12G -jar ${PICARD} AddOrReplaceReadGroups \
+    I=${BAM_DIR}/${ACC}.markdup.bam \
+    O=${BAM_DIR}/${ACC}.RG.bam \
+    RGID=${ACC} RGLB=lib1 RGPL=ILLUMINA RGPU=unit1 RGSM=${ACC}
+if [ \$? -ne 0 ]; then exit 1; fi
+
+${SAMTOOLS} index ${BAM_DIR}/${ACC}.RG.bam
+if [ \$? -ne 0 ]; then exit 1; fi
+EOF
+)
+MARKDUP_JOBS+=($JOB)
+done
+
+MARKDUP_DEP=$(IFS=:; echo "afterok:${MARKDUP_JOBS[*]}")
+
+# STEP 8: HaplotypeCaller scatter array (one chunk per array task, all 3 samples)
+
+HC_ARRAY_SCRIPT="$SCRIPTS_DIR/hc_array.sh"
+cat > "$HC_ARRAY_SCRIPT" << HCEOF
+#!/bin/bash
+#SBATCH --job-name=${SPECIES}_HC
+#SBATCH --account=${ACCOUNT}
+#SBATCH --partition=${PARTITION}
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=20G
+#SBATCH --time=12:00:00
+#SBATCH --array=0-49
+#SBATCH --output=${LOG_DIR}/hc_%A_%a.out
+#SBATCH --error=${LOG_DIR}/hc_%A_%a.err
+#SBATCH --mail-user=${MAIL}
+#SBATCH --mail-type=FAIL
+
+module load Bioinformatics
+module load openjdk/17.0.11_9-n4ldn5m
+
+CHUNK=\$(printf "%04d" "\${SLURM_ARRAY_TASK_ID}")
+INTERVAL_FILE="${INTERVALS_DIR}/\${CHUNK}-scattered.interval_list"
+
+if [ ! -f "\$INTERVAL_FILE" ]; then
+    exit 1
+fi
+
+for ACC in ${FATHER_ACC} ${MOTHER_ACC} ${CHILD_ACC}; do
+    OUTDIR="${GVCF_CHUNKS}/\${ACC}"
+    OUT="\${OUTDIR}/chunk_\${CHUNK}.g.vcf.gz"
+    BAM="${BAM_DIR}/\${ACC}.RG.bam"
+
+    mkdir -p "\$OUTDIR"
+
+    if [ ! -f "\$BAM" ]; then
+        exit 1
+    fi
+
+    if [ -f "\${OUT}.tbi" ]; then
+        continue
+    fi
+
+    java -Xmx18g \
+        -jar ${GATK_JAR} HaplotypeCaller \
+        -R ${REF} \
+        -I "\$BAM" \
+        -O "\$OUT" \
+        -L "\$INTERVAL_FILE" \
+        -ERC BP_RESOLUTION \
+        --native-pair-hmm-threads 4 \
+        --smith-waterman FASTEST_AVAILABLE \
+        --pair-hmm-implementation FASTEST_AVAILABLE \
+        --max-reads-per-alignment-start 50 \
+        --tmp-dir ${TMP}
+
+    if [ \$? -ne 0 ]; then exit 1; fi
+done
+HCEOF
+
+chmod +x "$HC_ARRAY_SCRIPT"
+
+HC_JID=$(sbatch --parsable \
+    --dependency=afterok:${MARKDUP_JOBS[0]}:${MARKDUP_JOBS[1]}:${MARKDUP_JOBS[2]}:${JOB_SPLIT} \
+    "$HC_ARRAY_SCRIPT")
+
+# STEP 9: Gather gVCF chunks per sample
+
+GATHER_JOBS=()
+for ACC in "${SAMPLES[@]}"; do
+JOB=$(sbatch --parsable \
+--dependency=afterok:${HC_JID} \
+--job-name=${SPECIES}_gather_${ACC} \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=2 --mem=16G --time=02:00:00 \
+--output=$LOG_DIR/gather_${ACC}_%j.out --error=$LOG_DIR/gather_${ACC}_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+module load Bioinformatics
+module load openjdk/17.0.11_9-n4ldn5m
+
+mkdir -p ${GVCF_FINAL}
+
+if [ -s "${GVCF_FINAL}/${ACC}.g.vcf.gz" ] && [ -f "${GVCF_FINAL}/${ACC}.g.vcf.gz.tbi" ]; then
+    exit 0
+fi
+
+INPUT_ARGS=""
+for i in \$(seq 0 49); do
+    CHUNK=\$(printf "%04d" "\$i")
+    F="${GVCF_CHUNKS}/${ACC}/chunk_\${CHUNK}.g.vcf.gz"
+    if [ -f "\$F" ]; then
+        INPUT_ARGS="\$INPUT_ARGS -I \$F"
+    fi
+done
+
+if [ -z "\$INPUT_ARGS" ]; then
+    exit 1
+fi
+
+java -Xmx14g -jar ${GATK_JAR} MergeVcfs \
+    \$INPUT_ARGS \
+    -O ${GVCF_FINAL}/${ACC}.g.vcf.gz \
+    --TMP_DIR ${TMP}
+if [ \$? -ne 0 ]; then exit 1; fi
+EOF
+)
+GATHER_JOBS+=($JOB)
+done
+
+GATHER_DEP=$(IFS=:; echo "afterok:${GATHER_JOBS[*]}")
+
+# STEP 10: CombineGVCFs
+# index0=FATHER, index1=MOTHER, index2=CHILD
+
+
+JOB_COMBINE=$(sbatch --parsable \
+--dependency=$GATHER_DEP \
+--job-name=${SPECIES}_combine \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=4 --mem=32G --time=24:00:00 \
+--output=$LOG_DIR/combine_%j.out --error=$LOG_DIR/combine_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+module load Bioinformatics
+module load openjdk/17.0.11_9-n4ldn5m
+
+mkdir -p ${JOINT_DIR}
+
+if [ -s "${JOINT_DIR}/combined.g.vcf.gz" ] && [ -f "${JOINT_DIR}/combined.g.vcf.gz.tbi" ]; then
+    exit 0
+fi
+
+java -Xmx28g -jar ${GATK_JAR} CombineGVCFs \
+    -R ${REF} \
+    -V ${GVCF_FINAL}/${FATHER_ACC}.g.vcf.gz \
+    -V ${GVCF_FINAL}/${MOTHER_ACC}.g.vcf.gz \
+    -V ${GVCF_FINAL}/${CHILD_ACC}.g.vcf.gz \
+    -O ${JOINT_DIR}/combined.g.vcf.gz \
+    --tmp-dir ${TMP}
+if [ \$? -ne 0 ]; then exit 1; fi
+EOF
+)
+
+# STEP 11: GenotypeGVCFs scatter array
+
+GENO_ARRAY_SCRIPT="$SCRIPTS_DIR/geno_array.sh"
+cat > "$GENO_ARRAY_SCRIPT" << GENOEOF
+#!/bin/bash
+#SBATCH --job-name=${SPECIES}_geno
+#SBATCH --account=${ACCOUNT}
+#SBATCH --partition=${PARTITION}
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=16G
+#SBATCH --time=04:00:00
+#SBATCH --array=0-49
+#SBATCH --output=${LOG_DIR}/geno_%A_%a.out
+#SBATCH --error=${LOG_DIR}/geno_%A_%a.err
+#SBATCH --mail-user=${MAIL}
+#SBATCH --mail-type=FAIL
+
+module load Bioinformatics
+module load openjdk/17.0.11_9-n4ldn5m
+
+mkdir -p ${GENO_CHUNKS}
+
+CHUNK=\$(printf "%04d" "\${SLURM_ARRAY_TASK_ID}")
+INTERVAL_FILE="${INTERVALS_DIR}/\${CHUNK}-scattered.interval_list"
+OUT="${GENO_CHUNKS}/chunk_\${CHUNK}.vcf.gz"
+
+if [ ! -f "\$INTERVAL_FILE" ]; then exit 1; fi
+if [ -f "\${OUT}.tbi" ]; then exit 0; fi
+
+java -Xmx14g -jar ${GATK_JAR} GenotypeGVCFs \
+    -R ${REF} \
+    -V ${JOINT_DIR}/combined.g.vcf.gz \
+    -O "\$OUT" \
+    -L "\$INTERVAL_FILE" \
+    --tmp-dir ${TMP}
+if [ \$? -ne 0 ]; then exit 1; fi
+GENOEOF
+
+chmod +x "$GENO_ARRAY_SCRIPT"
+
+GENO_JID=$(sbatch --parsable \
+    --dependency=afterok:${JOB_COMBINE} \
+    "$GENO_ARRAY_SCRIPT")
+
+# STEP 12: Gather genotyped chunks into final VCF
+
+JOB_GENO_GATHER=$(sbatch --parsable \
+--dependency=afterok:${GENO_JID} \
+--job-name=${SPECIES}_geno_gather \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=2 --mem=16G --time=02:00:00 \
+--output=$LOG_DIR/geno_gather_%j.out --error=$LOG_DIR/geno_gather_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+module load Bioinformatics
+module load openjdk/17.0.11_9-n4ldn5m
+
+if [ -s "${JOINT_DIR}/genotyped.vcf.gz" ] && [ -f "${JOINT_DIR}/genotyped.vcf.gz.tbi" ]; then
+    exit 0
+fi
+
+INPUT_ARGS=""
+for i in \$(seq 0 49); do
+    CHUNK=\$(printf "%04d" "\$i")
+    F="${GENO_CHUNKS}/chunk_\${CHUNK}.vcf.gz"
+    if [ -f "\$F" ]; then
+        INPUT_ARGS="\$INPUT_ARGS -I \$F"
+    fi
+done
+
+if [ -z "\$INPUT_ARGS" ]; then exit 1; fi
+
+java -Xmx14g -jar ${GATK_JAR} MergeVcfs \
+    \$INPUT_ARGS \
+    -O ${JOINT_DIR}/genotyped.vcf.gz \
+    --TMP_DIR ${TMP}
+if [ \$? -ne 0 ]; then exit 1; fi
+EOF
+)
+
+# STEP 13: DNM filtering
+
+sbatch \
+--dependency=afterok:${JOB_GENO_GATHER} \
+--job-name=${SPECIES}_dnm \
+--account=$ACCOUNT --partition=$PARTITION \
+--nodes=1 --ntasks=1 --cpus-per-task=4 --mem=32G --time=10:00:00 \
+--output=$LOG_DIR/dnm_%j.out --error=$LOG_DIR/dnm_%j.err \
+--mail-user=$MAIL --mail-type=END,FAIL \
+<<EOF
+#!/bin/bash
+module load Bioinformatics
+module load openjdk/17.0.11_9-n4ldn5m
+module load bcftools/1.21
+
+mkdir -p ${DNM_DIR}
+
+java -Xmx28g -jar ${GATK_JAR} VariantFiltration \
+    -R ${REF} \
+    -V ${JOINT_DIR}/genotyped.vcf.gz \
+    --filter-expression "QD < 2.0"             --filter-name "QD2" \
+    --filter-expression "FS > 20.0"             --filter-name "FS20" \
+    --filter-expression "MQ < 40.0"             --filter-name "MQ40" \
+    --filter-expression "MQRankSum < -2.0"      --filter-name "MQRankSumLow" \
+    --filter-expression "MQRankSum > 4.0"       --filter-name "MQRankSumHigh" \
+    --filter-expression "ReadPosRankSum < -3.0" --filter-name "ReadPosLow" \
+    --filter-expression "ReadPosRankSum > 3.0"  --filter-name "ReadPosHigh" \
+    --filter-expression "SOR > 3.0"             --filter-name "SOR3" \
+    -O ${DNM_DIR}/site_filtered.vcf.gz \
+    --tmp-dir ${TMP}
+if [ \$? -ne 0 ]; then exit 1; fi
+
+bcftools view -f PASS ${DNM_DIR}/site_filtered.vcf.gz \
+    -O z -o ${DNM_DIR}/site_pass.vcf.gz
+bcftools index -t ${DNM_DIR}/site_pass.vcf.gz
+if [ \$? -ne 0 ]; then exit 1; fi
+
+bcftools view ${DNM_DIR}/site_pass.vcf.gz | \
+bcftools filter \
+    --include "GT[0]='0/0' && GT[1]='0/0' && GT[2]='0/1'" \
+    -O z -o ${DNM_DIR}/mendelian.vcf.gz
+bcftools index -t ${DNM_DIR}/mendelian.vcf.gz
+if [ \$? -ne 0 ]; then exit 1; fi
+
+MDEPTH=\$(bcftools query -f '[%DP\t]\n' ${DNM_DIR}/mendelian.vcf.gz | \
+    awk '{for(i=1;i<=NF;i++) {sum+=\$i; n++}} END {print sum/n}')
+DP_MIN=\$(echo "\$MDEPTH * 0.5" | awk '{printf "%.0f", \$1}')
+DP_MAX=\$(echo "\$MDEPTH * 2.0" | awk '{printf "%.0f", \$1}')
+
+bcftools filter \
+    --include "FORMAT/GQ[0] >= 30 && FORMAT/GQ[1] >= 30 && FORMAT/GQ[2] >= 60 && \
+               FORMAT/DP[0] >= \${DP_MIN} && FORMAT/DP[0] <= \${DP_MAX} && \
+               FORMAT/DP[1] >= \${DP_MIN} && FORMAT/DP[1] <= \${DP_MAX} && \
+               FORMAT/DP[2] >= \${DP_MIN} && FORMAT/DP[2] <= \${DP_MAX} && \
+               FORMAT/AD[0:1] = 0 && FORMAT/AD[1:1] = 0 && \
+               (FORMAT/AD[2:1]) / (FORMAT/AD[2:0] + FORMAT/AD[2:1]) >= 0.30 && \
+               (FORMAT/AD[2:1]) / (FORMAT/AD[2:0] + FORMAT/AD[2:1]) <= 0.70" \
+    ${DNM_DIR}/mendelian.vcf.gz \
+    -O z -o ${DNM_DIR}/dnm_candidates.vcf.gz
+bcftools index -f -t ${DNM_DIR}/dnm_candidates.vcf.gz
+if [ \$? -ne 0 ]; then exit 1; fi
+
+bcftools query -f '%CHROM\t%POS0\t%END\n' \
+    ${DNM_DIR}/dnm_candidates.vcf.gz > ${DNM_DIR}/candidate_regions.bed
+
+if [ ! -s "${DNM_DIR}/candidate_regions.bed" ]; then
+    exit 1
+fi
+
+bcftools mpileup \
+    -R ${DNM_DIR}/candidate_regions.bed \
+    -f ${REF} \
+    ${BAM_DIR}/${FATHER_ACC}.RG.bam \
+    ${BAM_DIR}/${MOTHER_ACC}.RG.bam \
+    ${BAM_DIR}/${CHILD_ACC}.RG.bam | \
+bcftools call -m -O z -o ${DNM_DIR}/bcftools_recall.vcf.gz
+bcftools index -f -t ${DNM_DIR}/bcftools_recall.vcf.gz
+if [ \$? -ne 0 ]; then exit 1; fi
+
+bcftools filter \
+    --include "GT[0]='0/0' && GT[1]='0/0' && GT[2]='0/1'" \
+    ${DNM_DIR}/bcftools_recall.vcf.gz \
+    -O z -o ${DNM_DIR}/bcftools_confirmed.vcf.gz
+bcftools index -f -t ${DNM_DIR}/bcftools_confirmed.vcf.gz
+if [ \$? -ne 0 ]; then exit 1; fi
+
+bcftools isec \
+    ${DNM_DIR}/dnm_candidates.vcf.gz \
+    ${DNM_DIR}/bcftools_confirmed.vcf.gz \
+    -p ${DNM_DIR}/isec
+if [ \$? -ne 0 ]; then exit 1; fi
+
+bcftools query \
+    -f '%CHROM\t%POS\t%REF\t%ALT\t[%GT\t%DP\t%GQ\t%AD\t]\n' \
+    ${DNM_DIR}/isec/0002.vcf \
+    -o ${DNM_DIR}/final_DNM_table.txt
+
+sed -i '1s/^/CHROM\tPOS\tREF\tALT\tFATHER_GT\tFATHER_DP\tFATHER_GQ\tFATHER_AD\tMOTHER_GT\tMOTHER_DP\tMOTHER_GQ\tMOTHER_AD\tCHILD_GT\tCHILD_DP\tCHILD_GQ\tCHILD_AD\n/' \
+    ${DNM_DIR}/final_DNM_table.txt
+EOF
