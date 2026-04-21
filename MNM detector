@@ -1,0 +1,132 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+pd.options.mode.chained_assignment = None
+
+# CONFIGURATION USE TABLE OUTPUT FROM FIRST PIPELINE
+tableOutput = "Python with VENV/UROP/41586_2023_5752_MOESM5_ESM (2).csv"
+BPDistance = 4 #BP detection 
+# END OF CONFIGURATION
+
+
+df = pd.read_csv(tableOutput, skiprows=1)
+df = df[["Species", "Sample", "Chromosome", "Position", "REF", "ALT"]]
+
+
+
+print(df.shape)
+print(df.head())
+print(df.columns)
+
+
+
+df2 = (df.groupby("Species"))
+
+speciesTotalMutations = df2.size()
+
+print(speciesTotalMutations)
+df = df[df["Chromosome"] != "NA"] 
+df = df.sort_values(by=["Sample", "Chromosome", "Position"]).reset_index(drop=True)
+
+df["nextPosition"] = (df.groupby(["Sample", "Chromosome"])["Position"].shift(-1))
+df['distanceNext'] = df['nextPosition'] - df['Position']
+df["possibleMNM"] = df['distanceNext'] <= BPDistance 
+
+speciesMNMtemp = df[df["possibleMNM"]].copy()
+
+speciesMNM = (speciesMNMtemp.groupby("Species").size().reset_index())
+speciesMNM.columns = ["Species", "MNMs"]
+print(f"{speciesMNM} species MNM")
+summaryMutations = speciesTotalMutations.reset_index()
+summaryMutations.columns = ["Species", "Total Mutations"]
+summaryMutations = summaryMutations.merge(speciesMNM, on="Species", how="left")
+summaryMutations["MNMs"] = summaryMutations["MNMs"].fillna(0)
+summaryMutations["MNM frequency"] = (summaryMutations["MNMs"] / summaryMutations["Total Mutations"]).round(4)
+summaryMutations = summaryMutations.sort_values(by=["MNM frequency"], ascending = False)
+
+# Clades of species
+clade_map = {
+    "Rhea_pennata":"Bird","Taeniopygia_guttata":"Bird","Ara_glaucogularis":"Bird",
+    "Aptenodytes_forsteri":"Bird","Cyanistes_caeruleus":"Bird","Gallus_gallus":"Bird",
+    "Chauna_torquata":"Bird","Coturnix_japonica":"Bird","Bubo_scandiacus":"Bird",
+    "Larus_marinus":"Bird","Larus_argentatus":"Bird","Pelecanus_crispus":"Bird",
+    "Pygoscelis_adeliae":"Bird","Platalea_ajaja":"Bird","Phoenicopterus_roseus":"Bird",
+    "Saxicola_maurus":"Bird","Turdus_merula":"Bird","Gyps_fulvus":"Bird",
+
+    "Panthera_tigris":"Mammal","Odobenus_rosmarus":"Mammal","Cavia_aperea":"Mammal",
+    "Sus_scrofa":"Mammal","Homo_sapiens":"Mammal","Pithecia_pithecia":"Mammal",
+    "Canis_lupus_familiaris":"Mammal","Arctocephalus_gazella":"Mammal",
+    "Ailurus_fulgens":"Mammal","Fukomys_damarensis":"Mammal","Cervus_nippon":"Mammal",
+    "Capra_hircus":"Mammal","Ceratotherium_simum_simum":"Mammal",
+    "Cervus_elaphus_yarkandensis":"Mammal","Mus_musculus":"Mammal",
+    "Moschus_berezovskii":"Mammal","Monodelphis_domestica":"Mammal",
+    "Mandrillus_leucophaeus":"Mammal","Hylobates_lar":"Mammal",
+    "Hippopotamus_amphibius":"Mammal","Panthera_pardus":"Mammal",
+    "Pan_troglodytes":"Mammal","Orcinus_orca":"Mammal","Neovison_vison":"Mammal",
+    "Rangifer_tarandus":"Mammal","Procavia_capensis":"Mammal",
+    "Vicugna_pacos":"Mammal","Vulpes_vulpes":"Mammal",
+    "Saimiri_boliviensis_boliviensis":"Mammal","Tapirus_indicus":"Mammal",
+    "Tupaia_belangeri":"Mammal","Tursiops_truncatus":"Mammal",
+    "Rousettus_aegyptiacus":"Mammal","Felis_catus":"Mammal",
+    
+    "Sphaerodactylus_macrolepis":"Reptile","Eublepharis_macularius":"Reptile",
+    "Pogona_vitticeps":"Reptile","Thamnophis_sirtalis":"Reptile",
+    "Chrysemys_picta":"Reptile","Coleonyx_brevis":"Reptile",
+
+    "Salmo_salar":"Fish","Cyprinus_carpio":"Fish","Cynoglossus_semilaevis":"Fish",
+    "Betta_splendens":"Fish","Larimichthys_crocea":"Fish",
+    "Paralichthys_olivaceus":"Fish","Syngnathus_scovelli":"Fish",
+    "Amphiprion_ocellaris":"Fish",
+
+    "Giraffa_camelopardalis":"Mammal","Sarcophilus_harrisii":"Mammal"
+}
+
+summaryMutations["Clade"] = summaryMutations["Species"].map(clade_map)
+summaryMutations["Clade"] = summaryMutations["Clade"].fillna("Unknown")  # Safety fallback
+
+# Compute clade-level summary with min/max
+clade_summary = summaryMutations.groupby("Clade").agg(
+    Number_of_Species = ("Species", "count"),
+    Total_Mutations = ("Total Mutations", "sum"),
+    Total_MNMs = ("MNMs", "sum"),
+    Mean_MNM_Frequency = ("MNM frequency", "mean"),
+    Min_MNM_Frequency = ("MNM frequency", "min"),
+    Max_MNM_Frequency = ("MNM frequency", "max")
+).reset_index()
+
+# Save new CSV
+clade_summary_filename = f"MNM_clade_summary_{BPDistance}.csv"
+clade_summary.to_csv(clade_summary_filename, index=False)
+print("Created clade summary:", clade_summary_filename)
+
+
+nameOfFile2 = f"MNM Mutations ratio for {BPDistance} distance.csv"
+summaryMutations.to_csv(nameOfFile2, index=False)
+
+MNM = df[df["possibleMNM"]].copy()
+
+print("Total mutations:", len(df))
+totalMutations = len(df)
+print("Possble MNM pairs", len(MNM))
+print("MNM Mutations")
+print(MNM.to_string())
+
+nameOfFile = f"MNM Mutations ({len(MNM)}) for {BPDistance} distance.csv"
+MNM.to_csv(nameOfFile, index=False)
+
+try:
+    master = pd.read_csv("Mutations dataset.csv")
+    file_exists = True
+except:
+    master = pd.DataFrame(columns=["BPDistance", "Total Mutations", "MNM Pairs", "MNM Frequency"])
+    file_exists = False
+
+current_result = pd.DataFrame({"BPDistance": [BPDistance],"Total Mutations": [totalMutations],"MNM Pairs": [len(MNM)],"MNM Frequency": [round(len(MNM) / totalMutations, 6)]})
+
+if BPDistance in master["BPDistance"].values:
+    print(f"BPDistance={BPDistance} already logged. Skipping append.")
+else:
+    updated = pd.concat([master, current_result], ignore_index=True)
+    updated.to_csv("Mutations dataset.csv", index=False)
+    print(f"Added BPDistance={BPDistance} entry to Mutations dataset.")
